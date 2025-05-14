@@ -1,109 +1,204 @@
-# Import niezbędnych bibliotek
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
+import re
 
-# URL strony z harmonogramem egzaminów
-url = "https://wit.pwr.edu.pl/studenci/organizacja-toku-studiow/harmonogram-egzaminow"
+def clean_text(text):
+    """Usuwa nadmiarowe białe znaki i formatowanie tekstu."""
+    if text is None:
+        return ""
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-# Pobranie zawartości strony
-try:
-    response = requests.get(url)
-    response.raise_for_status()  # Sprawdzenie błędów HTTP
-    html = response.content
-except Exception as e:
-    print(f"Wystąpił błąd podczas pobierania strony: {e}")
-    exit()
+def get_cell_text(cell):
+    """Pobiera tekst z komórki tabeli z uwzględnieniem formatowania."""
+    if cell is None:
+        return ""
+    # Pobierz tekst z wszystkich elementów p w komórce
+    p_texts = [clean_text(p.get_text()) for p in cell.find_all('p')]
+    # Jeśli nie ma elementów p, pobierz bezpośrednio tekst z komórki
+    if not p_texts:
+        return clean_text(cell.get_text())
+    # Połącz tekst z elementów p
+    return " ".join(filter(None, p_texts))
 
-# Parsowanie HTML
-soup = BeautifulSoup(html, "html.parser")
-
-# Znalezienie wszystkich tabel na stronie
-tables = soup.find_all("table")
-
-# Lista do przechowywania danych o egzaminach
-exam_data = []
-
-# Iteracja przez wszystkie tabele
-for table in tables:
-    # Pobranie wszystkich wierszy tabeli
-    rows = table.find_all("tr")
-    
-    # Sprawdzenie, czy tabela ma wystarczającą liczbę wierszy
+def extract_table_data(table):
+    """Ekstrahuje dane z tabeli HTML."""
+    rows = table.find_all('tr')
     if len(rows) < 2:
-        continue
+        return []
     
-    # Pobranie nagłówków tabeli
+    # Pobierz nagłówki
     header_row = rows[0]
-    headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
+    headers = [get_cell_text(cell) for cell in header_row.find_all(['th', 'td'])]
     
-    if not ("Termin" in headers and "data" in headers and "godzina" in headers):
-        continue
+    # Sprawdź czy to tabela z egzaminami
+    if not any(header.lower() in ["termin", "data", "godzina"] for header in headers):
+        return []
     
-    # Zmienna do przechowywania danych o bieżącym kursie
-    current_course = None
+    # Standaryzacja nazw kolumn
+    standardized_headers = []
+    for header in headers:
+        header_lower = header.lower()
+        if "kierunek" in header_lower or "specjalno" in header_lower:
+            standardized_headers.append("Kierunek/Specjalność")
+        elif "kod" in header_lower:
+            standardized_headers.append("Kod kursu")
+        elif "nazwa" in header_lower:
+            standardized_headers.append("Nazwa kursu")
+        elif "prowadz" in header_lower:
+            standardized_headers.append("Prowadzący")
+        elif "termin" in header_lower:
+            standardized_headers.append("Termin")
+        elif "data" in header_lower:
+            standardized_headers.append("Data")
+        elif "godzina" in header_lower:
+            standardized_headers.append("Godzina")
+        elif "sala" in header_lower:
+            standardized_headers.append("Sala")
+        elif "budynek" in header_lower:
+            standardized_headers.append("Budynek")
+        else:
+            standardized_headers.append(header)
     
-    # Iteracja przez wiersze danych (pomijając nagłówek)
-    for row in rows[1:]:
-        cells = row.find_all(["td", "th"])
-        row_data = [cell.get_text(strip=True) for cell in cells]
+    # Funkcja do analizy struktury tabeli i obsługi rowspan/colspan
+    data = []
+    
+    # Słownik do śledzenia komórek z rowspan
+    rowspan_data = {}
+    
+    for row_index, row in enumerate(rows[1:], 1):
+        row_data = {}
+        col_index = 0
         
-        # Ignorowanie pustych wierszy
-        #if not row_data or all(not cell for cell in row_data):
-            #continue
+        cells = row.find_all(['th', 'td'])
         
-        # Sprawdzenie, czy to wiersz z pełnymi danymi kursu
-        if len(row_data) >= 5 and "II termin" not in row_data:
-            # Tworzenie słownika z danymi wiersza
-            course_data = {}
+        # Uzupełnienie danymi z komórek z rowspan z poprzednich wierszy
+        for col_idx, col_data in sorted(rowspan_data.items()):
+            if row_index in col_data["rows"]:
+                row_data[col_data["header"]] = col_data["value"]
+                
+        # Przetwarzanie komórek w bieżącym wierszu
+        for cell_index, cell in enumerate(cells):
+            # Przesunięcie indeksu kolumny, aby uwzględnić rowspan z poprzednich wierszy
+            while col_index in [span_data["col_index"] for span_data in rowspan_data.values() 
+                                if row_index in span_data["rows"]]:
+                col_index += 1
             
-            # Mapowanie danych do odpowiednich pól
-            for i, header in enumerate(headers):
-                if i < len(row_data):
-                    course_data[header] = row_data[i]
+            # Pobierz tekst z komórki
+            cell_text = get_cell_text(cell)
             
-            # Zapisanie bieżącego kursu
-            current_course = course_data
+            # Pobierz atrybuty rowspan i colspan
+            rowspan = int(cell.get('rowspan', 1))
+            colspan = int(cell.get('colspan', 1))
             
-            # Dodanie danych dla pierwszego terminu
-            exam_data.append(current_course)
+            # Jeśli komórka ma rowspan > 1, zapisz jej dane do późniejszego wykorzystania
+            if rowspan > 1:
+                affected_rows = list(range(row_index + 1, row_index + rowspan))
+                rowspan_data[len(rowspan_data)] = {
+                    "rows": affected_rows,
+                    "col_index": col_index,
+                    "header": standardized_headers[col_index] if col_index < len(standardized_headers) else f"Column_{col_index}",
+                    "value": cell_text
+                }
+            
+            # Zapisz wartość komórki w bieżącym wierszu
+            if col_index < len(standardized_headers):
+                header = standardized_headers[col_index]
+                row_data[header] = cell_text
+            
+            # Przesunięcie indeksu kolumny z uwzględnieniem colspan
+            col_index += colspan
         
-        # Sprawdzenie, czy to wiersz z informacją o drugim terminie
-        elif "II termin" in row_data and current_course:
-            # Tworzenie kopii danych bieżącego kursu
-            second_term = current_course.copy()
+        # Dodanie przetworzonych danych wiersza do wynikowej listy
+        if row_data:
+            # Sprawdź czy mamy do czynienia z wierszem II terminu
+            if "Termin" in row_data and "II termin" in row_data["Termin"]:
+                # Próba połączenia danych z poprzednim wierszem (I termin)
+                if data and all(key in data[-1] for key in ["Kierunek/Specjalność", "Kod kursu", "Nazwa kursu", "Prowadzący"]):
+                    for key in ["Kierunek/Specjalność", "Kod kursu", "Nazwa kursu", "Prowadzący"]:
+                        if key not in row_data and key in data[-1]:
+                            row_data[key] = data[-1][key]
             
-            # Indeks dla "II termin" w wierszu
-            termin_index = row_data.index("II termin")
-            
-            # Aktualizacja terminu
-            second_term["Termin"] = "II termin"
-            
-            # Aktualizacja pozostałych pól dla drugiego terminu
-            fields = ["data", "godzina", "sala", "budynek"]
-            for i, field in enumerate(fields):
-                if field in headers and termin_index + 1 + i < len(row_data):
-                    second_term[field] = row_data[termin_index + 1 + i]
-            
-            # Dodanie danych dla drugiego terminu
-            exam_data.append(second_term)
+            data.append(row_data)
+    
+    return data
 
-# Konwersja listy słowników na DataFrame
-df = pd.DataFrame(exam_data)
+def scrape_exam_schedule():
+    """Główna funkcja do pobrania harmonogramu egzaminów."""
+    url = "https://wit.pwr.edu.pl/studenci/organizacja-toku-studiow/harmonogram-egzaminow"
+    
+    print(f"Pobieranie danych z: {url}")
+    
+    try:
+        # Dodanie nagłówków dla lepszej kompatybilności
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        }
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        html_content = response.content
+        print(f"Pobrano stronę (status: {response.status_code})")
+    except Exception as e:
+        print(f"Błąd podczas pobierania strony: {e}")
+        return None
+    
+    # Parsowanie HTML
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Znalezienie wszystkich tabel na stronie
+    tables = soup.find_all('table')
+    print(f"Znaleziono {len(tables)} tabel na stronie")
+    
+    # Lista do przechowywania danych ze wszystkich tabel
+    all_data = []
+    
+    # Przetwarzanie każdej tabeli
+    for i, table in enumerate(tables):
+        print(f"Analizowanie tabeli {i+1}...")
+        table_data = extract_table_data(table)
+        if table_data:
+            print(f"  - Znaleziono {len(table_data)} rekordów w tabeli {i+1}")
+            all_data.extend(table_data)
+    
+    if not all_data:
+        print("Nie znaleziono żadnych danych w tabelach!")
+        return None
+    
+    print(f"Łącznie znaleziono {len(all_data)} rekordów")
+    
+    # Konwersja do DataFrame
+    df = pd.DataFrame(all_data)
+    
+    # Upewnienie się, że mamy wszystkie standardowe kolumny
+    required_columns = ["Kierunek/Specjalność", "Kod kursu", "Nazwa kursu", "Prowadzący", 
+                        "Termin", "Data", "Godzina", "Sala", "Budynek"]
+    
+    for col in required_columns:
+        if col not in df.columns:
+            df[col] = ""
+    
+    # Wybór tylko wymaganych kolumn w odpowiedniej kolejności
+    df = df[required_columns]
+    
+    return df
 
-# Zmiana nazw kolumn na bardziej czytelne
-column_mapping = {
-    "Kod kursu": "Kod kursu",
-    "Nazwa kursu": "Nazwa kursu",
-    "Prowadzący": "Prowadzący",
-    "Termin": "Termin",
-    "data": "Data",
-    "godzina": "Godzina",
-    "sala": "Sala",
-    "budynek": "Budynek"
-}
-df = df.rename(columns=column_mapping)
+def main():
+    # Pobranie danych
+    df = scrape_exam_schedule()
+    
+    if df is not None:
+        # Zapisanie do pliku CSV
+        output_file = "harmonogram_egzaminow.csv"
+        df.to_csv(output_file, index=False, encoding='utf-8-sig')  # użycie utf-8-sig dla poprawnej obsługi polskich znaków w Excelu
+        print(f"Dane zostały zapisane do pliku {output_file}")
+        
+        # Wyświetlenie pierwszych kilku wierszy
+        print("\nPierwszych 5 wierszy danych:")
+        print(df.head(5))
+    else:
+        print("Nie udało się pobrać danych harmonogramu egzaminów.")
 
-# Zapisanie danych do pliku CSV
-df.to_csv("harmonogram_egzaminow.csv", index=False, encoding="utf-8")
-print("Dane zostały zapisane do pliku harmonogram_egzaminow.csv")
+if __name__ == "__main__":
+    main()
